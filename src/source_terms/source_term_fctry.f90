@@ -34,6 +34,7 @@
 !> Defines a factory subroutine for source terms.
 submodule (source_term) source_term_fctry
   use const_source_term, only : const_source_term_t
+  use actuator_line_source_term, only : actuator_line_source_term_t
   use boussinesq_source_term, only : boussinesq_source_term_t
   use brinkman_source_term, only : brinkman_source_term_t
   use coriolis_source_term, only : coriolis_source_term_t
@@ -48,7 +49,7 @@ submodule (source_term) source_term_fctry
   implicit none
 
   ! List of all possible types created by the factory routine
-  character(len=25) :: SOURCE_KNOWN_TYPES(10) = [character(len=25) :: &
+  character(len=25) :: SOURCE_KNOWN_TYPES(11) = [character(len=25) :: &
        "constant", &
        "boussinesq", &
        "coriolis", &
@@ -58,7 +59,8 @@ submodule (source_term) source_term_fctry
        "sponge", &
        "field", &
        "hpfrt", &
-       "translation" &
+       "translation", &
+       "actuator_line" &
        ]
 
 contains
@@ -117,6 +119,8 @@ contains
        allocate(gradient_jump_penalty_t::object)
     case ("translation")
        allocate(translation_source_term_t::object)
+    case ("actuator_line")
+       allocate(actuator_line_source_term_t::object)
     case ("field")
        allocate(field_source_term_t::object)
     case ("hpfrt")

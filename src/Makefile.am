@@ -430,6 +430,9 @@ neko_fortran_SOURCES = \
 	source_terms/source_term_fctry.f90\
 	source_terms/sponge_source_term.f90\
 	source_terms/brinkman_source_term.f90\
+	source_terms/actuator_line_source_term.f90\
+	source_terms/bcknd/cpu/actuator_line_source_term_cpu.f90\
+	source_terms/bcknd/device/actuator_line_source_term_device.f90\
 	filter/mappings.f90\
 	filter/filter.f90\
 	filter/filter_fctry.f90\
