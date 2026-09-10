@@ -96,7 +96,7 @@ module actuator_line_source_term
      !> Velocities interpolated at the actuator line (z-component)
      type(vector_t), pointer :: w_interp => null()
      !> Circulation vector
-     real(kind=rp), allocatable :: gamm(:)
+     type(vector_t), pointer :: gamm => null()
      !> Sectional lift force
      real(kind=rp), allocatable :: lift(:)
      !> Sectional drag force
@@ -215,7 +215,7 @@ contains
     integer, optional, intent(out) :: id_out
 
     real(kind=rp) :: start_time, end_time
-    character(len=:), allocatable :: coefs_name
+    character(len=:), allocatable :: coefs_name, gamma_name
 
     ! Assign instance id
     next_actuator_line_id = next_actuator_line_id + 1
@@ -242,7 +242,11 @@ contains
     this%x_center = x_center_in
     this%y_center = y_center_in
     this%z_center = z_center_in
-    this%gamm = gamma_in
+
+    call this%make_registry_name("gamma", gamma_name)
+    call neko_registry%add_vector(this%N, gamma_name, .false.)
+    this%gamm => neko_registry%get_vector(gamma_name)
+    this%gamm%x = gamma_in(:)
 
     if (.not. this%owns_interpolator) then
        this%interpolator => interp
@@ -291,12 +295,10 @@ contains
     if (allocated(this%drag)) then
       deallocate(this%drag)
     end if
-    if (allocated(this%gamm)) then
-      deallocate(this%gamm)
-    end if
 
     if (associated(this%kernel_j)) nullify(this%kernel_j)
     nullify(this%x_vec)
+    nullify(this%gamm)
     nullify(this%u_interp)
     nullify(this%v_interp)
     nullify(this%w_interp)
@@ -464,7 +466,7 @@ contains
 
     do j = 1, this%N
       u_vec = [this%u_interp%x(j), this%v_interp%x(j), this%w_interp%x(j)]
-      call cross(u_vec, [0.0_rp, this%gamm(j), 0.0_rp], F_2D(j,:))
+      call cross(u_vec, [0.0_rp, this%gamm%x(j), 0.0_rp], F_2D(j,:))
       this%lift(j) = F_2D(j,3)
       this%drag(j) = F_2D(j,1)
     end do
