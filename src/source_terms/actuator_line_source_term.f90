@@ -66,7 +66,7 @@ module actuator_line_source_term
      !> Number of actuator line elements
      integer :: N
      !> Target lift coefficient
-     real(kind=rp) :: CL
+     real(kind=rp) :: CL_target
      !> Wingspan
      real(kind=rp) :: b
      !> Aspect ratio
@@ -94,19 +94,21 @@ module actuator_line_source_term
      !> Velocities interpolated at the actuator line (z-component)
      type(vector_t), pointer :: w_interp => null()
      !> Circulation vector
-     type(vector_t), pointer :: gamm => null()
-     !> Sectional lift force
-     real(kind=rp), allocatable :: lift(:)
-     !> Sectional drag force
-     real(kind=rp), allocatable :: drag(:)
-     !> Force coefficients vector [CL, CD]
-     type(vector_t), pointer :: coefs => null()
+     type(vector_t), pointer :: gamma_vec => null()
+     !> Sectional lift distribution
+     real(kind=rp), allocatable :: lift_dist(:)
+     !> Sectional drag distribution
+     real(kind=rp), allocatable :: drag_dist(:)
+     !> Resultant force vector
+     type(vector_t), pointer :: resultant_force => null() 
      !> Interpolator object
      type(global_interpolation_t), pointer :: interpolator => null()
      !> Flag to indicate if the source term owns the interpolator or if it was provided externally
      logical :: owns_interpolator = .false.
      !> Aerodynamicc coefficients file id
      integer :: coefs_out_num 
+     !> Force non-dimensionalizaton factor
+     real(kind=rp), pointer :: force_nondim_factor
 
    contains
      private
@@ -128,7 +130,7 @@ module actuator_line_source_term
      procedure, pass(this) :: compute_kernel
      procedure, pass(this) :: init_interpolator
      procedure, pass(this) :: F2D
-     procedure, pass(this) :: compute_coefficients
+     procedure, pass(this) :: compute_resultant_force
      procedure, pass(this) :: make_registry_name
      procedure, nopass :: cross
 
@@ -152,22 +154,23 @@ contains
     type(coef_t), intent(in), target :: coef
     character(len=*), intent(in) :: variable_name
 
-    integer :: N_in
-    real(kind=rp) :: CL_in, b_in, AR_in, eps_in, x_center_in, y_center_in, z_center_in
-    real(kind=rp), allocatable :: gamma_in(:)
+    integer :: N
+    real(kind=rp) :: CL, V_inf, b, AR, eps, x_center, y_center, z_center
+    real(kind=rp), allocatable :: gamma_vec(:)
     type(field_t), pointer :: u
 
     ! ------------------------------------------------------------------------ !
     ! Read the options for the actuator line source term
-    call json_get(json, 'N', N_in)
-    call json_get(json, 'CL_target', CL_in)
-    call json_get(json, 'b', b_in)
-    call json_get(json, 'AR', AR_in)
-    call json_get(json, 'eps', eps_in)
-    call json_get(json, 'xcenter', x_center_in)
-    call json_get(json, 'ycenter', y_center_in)
-    call json_get(json, 'zcenter', z_center_in)
-    call json_get(json, 'gamma', gamma_in)
+    call json_get(json, 'N', N)
+    call json_get(json, 'CL_target', CL)
+    call json_get(json, 'V_inf', V_inf)
+    call json_get(json, 'b', b)
+    call json_get(json, 'AR', AR)
+    call json_get(json, 'eps', eps)
+    call json_get(json, 'xcenter', x_center)
+    call json_get(json, 'ycenter', y_center)
+    call json_get(json, 'zcenter', z_center)
+    call json_get(json, 'gamma', gamma_vec)
 
     ! Initialize interpolator
     allocate(this%interpolator)
@@ -176,44 +179,46 @@ contains
     u => neko_registry%get_field_by_name('u') ! Use any field
     call this%interpolator%init(u%dof)
 
-    call actuator_line_source_term_init_from_components(this, fields, coef, N_in, CL_in, b_in, AR_in, eps_in, &
-        x_center_in, y_center_in, z_center_in, gamma_in(:), this%interpolator)
+    call actuator_line_source_term_init_from_components(this, fields, coef, N, CL, V_inf, b, AR, eps, &
+        x_center, y_center, z_center, gamma_vec(:), this%interpolator)
 
   end subroutine actuator_line_source_term_init_from_json
 
   !> The constructor from type components.
   !! @param fields A list of fields for adding the source values.
   !! @param coef The SEM coeffs.
-  !! @param N_in Number of actuator line elements.
-  !! @param CL_in Target lift coefficient.
-  !! @param b_in Wingspan.
-  !! @param AR_in Aspect ratio.
-  !! @param eps_in Gaussian kernel core size.
-  !! @param x_center_in Actuator line center X coordinate.
-  !! @param y_center_in Actuator line center Y coordinate.
-  !! @param z_center_in Actuator line center Z coordinate.
-  !! @param gamma_in Circulation vector.
+  !! @param N Number of actuator line elements.
+  !! @param CL Target lift coefficient.
+  !! @param V_inf Free stream velocity.
+  !! @param b Wingspan.
+  !! @param AR Aspect ratio.
+  !! @param eps Gaussian kernel core size.
+  !! @param x_center Actuator line center X coordinate.
+  !! @param y_center Actuator line center Y coordinate.
+  !! @param z_center Actuator line center Z coordinate.
+  !! @param gamma_vec Circulation vector.
   !! @param interp Global interpolator.
   !! @param id_out Optional output for the actuator line instance id.
-  subroutine actuator_line_source_term_init_from_components(this, fields, coef, N_in, CL_in, b_in, AR_in, eps_in, &
-        x_center_in, y_center_in, z_center_in, gamma_in, interp, id_out)
+  subroutine actuator_line_source_term_init_from_components(this, fields, coef, N, CL, V_inf, b, AR, eps, &
+        x_center, y_center, z_center, gamma_vec, interp, id_out)
     class(actuator_line_source_term_t), intent(inout) :: this
     type(field_list_t), intent(in), target :: fields
     type(coef_t), intent(in), target :: coef
-    integer, intent(in) :: N_in
-    real(kind=rp), intent(in) :: CL_in
-    real(kind=rp), intent(in) :: b_in
-    real(kind=rp), intent(in) :: AR_in
-    real(kind=rp), intent(in) :: eps_in
-    real(kind=rp), intent(in) :: x_center_in
-    real(kind=rp), intent(in) :: y_center_in
-    real(kind=rp), intent(in) :: z_center_in
-    real(kind=rp), intent(in) :: gamma_in(:)
+    integer, intent(in) :: N
+    real(kind=rp), intent(in) :: CL
+    real(kind=rp), intent(in) :: V_inf
+    real(kind=rp), intent(in) :: b
+    real(kind=rp), intent(in) :: AR
+    real(kind=rp), intent(in) :: eps
+    real(kind=rp), intent(in) :: x_center
+    real(kind=rp), intent(in) :: y_center
+    real(kind=rp), intent(in) :: z_center
+    real(kind=rp), intent(in) :: gamma_vec(:)
     type(global_interpolation_t), pointer, intent(in) :: interp
     integer, optional, intent(out) :: id_out
 
     real(kind=rp) :: start_time, end_time
-    character(len=:), allocatable :: coefs_name, gamma_name
+    character(len=:), allocatable :: resultant_force_name, gamma_name, force_nondim_factor_name
 
     ! Assign instance id
     next_actuator_line_id = next_actuator_line_id + 1
@@ -227,24 +232,24 @@ contains
     call this%init_base(fields, coef, start_time, end_time)
 
     ! Check gamma size
-    if (size(gamma_in) .ne. N_in) then
+    if (size(gamma_vec) .ne. N) then
        call neko_error('Gamma should have N elements.')
     end if
 
     ! Assign parameters
-    this%N = N_in
-    this%CL = CL_in
-    this%b = b_in
-    this%AR = AR_in
-    this%eps = eps_in
-    this%x_center = x_center_in
-    this%y_center = y_center_in
-    this%z_center = z_center_in
+    this%N = N
+    this%CL_target = CL
+    this%b = b
+    this%AR = AR
+    this%eps = eps
+    this%x_center = x_center
+    this%y_center = y_center
+    this%z_center = z_center
 
     call this%make_registry_name("gamma", gamma_name)
     call neko_registry%add_vector(this%N, gamma_name, .false.)
-    this%gamm => neko_registry%get_vector(gamma_name)
-    this%gamm%x = gamma_in(:)
+    this%gamma_vec => neko_registry%get_vector(gamma_name)
+    this%gamma_vec%x = gamma_vec(:)
 
     if (.not. this%owns_interpolator) then
        this%interpolator => interp
@@ -255,9 +260,15 @@ contains
     call this%compute_kernel() ! Pre-compute kernels
     call this%init_interpolator() ! Initialize interpolator
 
-    call this%make_registry_name("coefs", coefs_name)
-    call neko_registry%add_vector(2, coefs_name, .false.)
-    this%coefs => neko_registry%get_vector(coefs_name)
+    call this%make_registry_name("resultant_force", resultant_force_name)
+    call neko_registry%add_vector(2, resultant_force_name, .false.)
+    this%resultant_force => neko_registry%get_vector(resultant_force_name)
+
+    ! Force non-dimensionalization factor CL = (2 * AR / (V_inf * b)**2) * L
+    ! Since simulation is incompressible, rho cancels out with Kutta-Joukowski force computation
+    call this%make_registry_name("force_nondim_factor", force_nondim_factor_name)
+    call neko_registry%add_real_scalar(2.0_rp * this%AR / (V_inf * this%b)**2, force_nondim_factor_name, .false.)
+    this%force_nondim_factor => neko_registry%get_real_scalar(force_nondim_factor_name)
 
     ! Create aerodynamics coefficients file
     this%coefs_out_num = 10
@@ -284,16 +295,17 @@ contains
     if (allocated(this%xminus_vec)) then
       deallocate(this%xminus_vec)
     end if
-    if (allocated(this%lift)) then
-      deallocate(this%lift)
+    if (allocated(this%lift_dist)) then
+      deallocate(this%lift_dist)
     end if
-    if (allocated(this%drag)) then
-      deallocate(this%drag)
+    if (allocated(this%drag_dist)) then
+      deallocate(this%drag_dist)
     end if
 
     nullify(this%kernel)
     nullify(this%x_vec)
-    nullify(this%gamm)
+    nullify(this%gamma_vec)
+    nullify(this%resultant_force)
     nullify(this%u_interp)
     nullify(this%v_interp)
     nullify(this%w_interp)
@@ -352,10 +364,10 @@ contains
 
     allocate(this%xplus_vec(3, this%N))
     allocate(this%xminus_vec(3, this%N))
-    allocate(this%lift(this%N))
-    allocate(this%drag(this%N))
+    allocate(this%lift_dist(this%N))
+    allocate(this%drag_dist(this%N))
 
-    dy = this%b / this%N
+    dy = this%b / real(this%N, kind=rp)
 
     do j = 1, this%N
       this%x_vec%x(:, j) = [this%x_center, this%y_center - 0.5_rp * this%b + dy * (j - 0.5_rp), this%z_center]
@@ -438,7 +450,7 @@ contains
     real(kind=rp), intent(out) :: F_2D(this%N, 3)
 
     integer :: j
-    real(kind=rp) :: u_vec(3)
+    real(kind=rp) :: u_vec(3), CL, CD
     type (field_t), pointer :: up, vp, wp
 
     up => neko_registry%get_field_by_name("u")
@@ -459,24 +471,27 @@ contains
 
     do j = 1, this%N
       u_vec = [this%u_interp%x(j), this%v_interp%x(j), this%w_interp%x(j)]
-      call cross(u_vec, [0.0_rp, this%gamm%x(j), 0.0_rp], F_2D(j,:))
-      this%lift(j) = F_2D(j,3)
-      this%drag(j) = F_2D(j,1)
+      call cross(u_vec, [0.0_rp, this%gamma_vec%x(j), 0.0_rp], F_2D(j,:))
+      this%lift_dist(j) = F_2D(j,3)
+      this%drag_dist(j) = F_2D(j,1)
     end do
 
     ! Print and save to coefs file
-    call this%compute_coefficients()
-    write(this%coefs_out_num, *) time%t, ",", this%coefs%x(1), ",", this%coefs%x(2)
+    call this%compute_resultant_force()
+    CL = this%resultant_force%x(1) * this%force_nondim_factor
+    CD = this%resultant_force%x(2) * this%force_nondim_factor
+    write(this%coefs_out_num, *) time%t, ",", CL, ",", CD
+
   end subroutine F2D
 
   !> Compute 3D lift and drag coefficients 
-  subroutine compute_coefficients(this)
+  subroutine compute_resultant_force(this)
     class(actuator_line_source_term_t), intent(in) :: this
 
-    this%coefs%x(1) = this%AR * sum(this%lift / this%N) / (0.5_rp * this%b) ! CL
-    this%coefs%x(2) = this%AR * sum(this%drag / this%N) / (0.5_rp * this%b) ! CD
+    this%resultant_force%x(1) = sum(this%lift_dist) * (this%b / real(this%N, kind=rp)) ! Lift
+    this%resultant_force%x(2) = sum(this%drag_dist) * (this%b / real(this%N, kind=rp)) ! Drag
 
-  end subroutine compute_coefficients
+  end subroutine compute_resultant_force
 
   subroutine make_registry_name(this, base_name, registry_name)
     class(actuator_line_source_term_t), intent(in) :: this
