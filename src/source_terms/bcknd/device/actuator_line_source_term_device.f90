@@ -36,9 +36,11 @@ module actuator_line_source_term_device
   use num_types, only : rp
   use field_list, only : field_list_t
   use field, only : field_t
+  use matrix, only : matrix_t
   use device, only : device_memcpy, HOST_TO_DEVICE, DEVICE_TO_HOST
   use device_math, only : device_rzero, device_add2s2
   use registry, only : neko_registry
+  use scratch_registry, only : neko_scratch_registry
   implicit none
   private
 
@@ -48,21 +50,18 @@ contains
 
   !> Computes the actuator line source term on the device.
   !! @param kernel Gaussian convolution kernel.
-  !! @param kernel_j Field for holding kernel values and performing operations on the GPU.
   !! @param F_2D Idealized point source on each actuator line segment.
   !! @param fields The right-hand side, which should be the velocity components.
-  subroutine actuator_line_source_term_compute_device(kernel, kernel_j, F_2D, fields)
-    real(kind=rp), intent(in) :: kernel(:,:)
-    type(field_t), intent(inout), pointer :: kernel_j
-    real(kind=rp), intent(in) :: F_2D(size(kernel, 2), 3)
+  subroutine actuator_line_source_term_compute_device(kernel, F_2D, fields)
+    type(matrix_t), pointer, intent(in) :: kernel
+    real(kind=rp), intent(in) :: F_2D(size(kernel%x, 2), 3)
     type(field_list_t), intent(inout) :: fields
 
-    integer :: j, n, n_alm
-    type (field_t), pointer :: u, v, w, u_rhs, v_rhs, w_rhs
-    real(kind=rp) :: kernel_temp(size(kernel, 1))
+    integer :: j, n, n_alm, temp_index
+    type (field_t), pointer :: u, v, w, u_rhs, v_rhs, w_rhs, temp_kernel
 
     n = fields%item_size(1)
-    n_alm = size(kernel, 2)
+    n_alm = size(kernel%x, 2)
 
     ! Get pointers to velocity fields
     u => neko_registry%get_field_by_name('u')
@@ -79,14 +78,18 @@ contains
     call device_rzero(v_rhs%x_d, n)
     call device_rzero(w_rhs%x_d, n)
 
+    ! Get a temporary field for the kernel
+    call neko_scratch_registry%request_field(temp_kernel, temp_index, .false.)
+
     ! ! Update source terms
     do j = 1, n_alm
-      kernel_temp = kernel(:,j)
-      call device_memcpy(kernel_temp, kernel_j%x_d, n, HOST_TO_DEVICE, sync=.true.)
-      call device_add2s2(u_rhs%x_d, kernel_j%x_d, -F_2D(j,1), n)
-      call device_add2s2(v_rhs%x_d, kernel_j%x_d, -F_2D(j,2), n)
-      call device_add2s2(w_rhs%x_d, kernel_j%x_d, -F_2D(j,3), n)
+      call device_memcpy(kernel%x(:,j), temp_kernel%x_d, n, HOST_TO_DEVICE, sync=.true.)
+      call device_add2s2(u_rhs%x_d, temp_kernel%x_d, -F_2D(j,1), n)
+      call device_add2s2(v_rhs%x_d, temp_kernel%x_d, -F_2D(j,2), n)
+      call device_add2s2(w_rhs%x_d, temp_kernel%x_d, -F_2D(j,3), n)
     end do
+
+    call neko_scratch_registry%relinquish_field(temp_index)
 
   end subroutine actuator_line_source_term_compute_device
 

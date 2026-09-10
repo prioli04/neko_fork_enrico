@@ -86,9 +86,7 @@ module actuator_line_source_term
      !> Actuator line elements' left node coordinates
      real(kind=rp), allocatable :: xminus_vec(:,:)
      !> Gaussian kernel values (entire domain and for each actuator line elements)
-     real(kind=rp), allocatable :: kernel(:,:)
-     !> Field for holding kernel values and performing operations on the GPU
-     type(field_t), pointer :: kernel_j => null()
+     type(matrix_t), pointer :: kernel => null()
      !> Velocities interpolated at the actuator line (x-component)
      type(vector_t), pointer :: u_interp => null()
      !> Velocities interpolated at the actuator line (y-component)
@@ -286,9 +284,6 @@ contains
     if (allocated(this%xminus_vec)) then
       deallocate(this%xminus_vec)
     end if
-    if (allocated(this%kernel)) then
-      deallocate(this%kernel)
-    end if
     if (allocated(this%lift)) then
       deallocate(this%lift)
     end if
@@ -296,7 +291,7 @@ contains
       deallocate(this%drag)
     end if
 
-    if (associated(this%kernel_j)) nullify(this%kernel_j)
+    nullify(this%kernel)
     nullify(this%x_vec)
     nullify(this%gamm)
     nullify(this%u_interp)
@@ -330,7 +325,7 @@ contains
     call this%F2D(time, F_2D)
 
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       call actuator_line_source_term_compute_device(this%kernel, this%kernel_j, F_2D, this%fields)
+       call actuator_line_source_term_compute_device(this%kernel, F_2D, this%fields)
     else
        call actuator_line_source_term_compute_cpu(this%kernel, F_2D, this%fields)
     end if
@@ -382,11 +377,9 @@ contains
 
     ! Allocate kernels
     u => neko_registry%get_field_by_name('u') ! Use any field
-    allocate(this%kernel(u%dof%size(), this%N))
-    
     call this%make_registry_name("kernel", kernel_name)
-    call neko_registry%add_field(u%dof, kernel_name, .false.)
-    this%kernel_j => neko_registry%get_field(kernel_name)
+    call neko_registry%add_matrix(u%dof%size(), this%N, kernel_name, .false.)
+    this%kernel => neko_registry%get_matrix(kernel_name)
 
     ! Loop through all actuator line elements
     do j = 1, this%N
@@ -409,7 +402,7 @@ contains
         lminus = lplus + xp_xm_norm
         d = sqrt(norm2(x_vec_ij - xminus)**2 - lminus**2)
 
-        this%kernel(i,j) = (1.0 / (pi * this%eps**2)) * exp(- d**2 / this%eps**2) * &
+        this%kernel%x(i,j) = (1.0 / (pi * this%eps**2)) * exp(- d**2 / this%eps**2) * &
                            (erf(lminus / this%eps) - erf(lplus / this%eps)) / 2.0
       end do
     end do

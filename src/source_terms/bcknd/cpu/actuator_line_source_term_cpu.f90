@@ -34,6 +34,7 @@
 module actuator_line_source_term_cpu
   use num_types, only : rp
   use field_list, only : field_list_t
+  use matrix, only : matrix_t
   use math, only : rzero, add2s2
   use field, only : field_t
   use registry, only : neko_registry
@@ -49,15 +50,15 @@ contains
   !! @param F_2D Idealized point source on each actuator line segment.
   !! @param fields The right-hand side, which should be the velocity components.
   subroutine actuator_line_source_term_compute_cpu(kernel, F_2D, fields)
-    real(kind=rp), intent(in) :: kernel(:,:)
-    real(kind=rp), intent(in) :: F_2D(size(kernel, 2), 3)
+    type(matrix_t), pointer, intent(in) :: kernel
+    real(kind=rp), intent(in) :: F_2D(size(kernel%x, 2), 3)
     type(field_list_t), intent(inout) :: fields
 
     integer :: j, n, n_alm
     type (field_t), pointer :: u, v, w, u_rhs, v_rhs, w_rhs
 
     n = fields%item_size(1)
-    n_alm = size(kernel, 2)
+    n_alm = size(kernel%x, 2)
 
     ! Get pointers to velocity fields
     u => neko_registry%get_field_by_name('u')
@@ -75,9 +76,9 @@ contains
 
     ! Update source terms
     do j = 1, n_alm
-      call add2s2(u_rhs%x(:,1,1,1), kernel(:,j), -F_2D(j,1), n)
-      call add2s2(v_rhs%x(:,1,1,1), kernel(:,j), -F_2D(j,2), n)
-      call add2s2(w_rhs%x(:,1,1,1), kernel(:,j), -F_2D(j,3), n)
+      call add2s2(u_rhs%x(:,1,1,1), kernel%x(:,j), -F_2D(j,1), n)
+      call add2s2(v_rhs%x(:,1,1,1), kernel%x(:,j), -F_2D(j,2), n)
+      call add2s2(w_rhs%x(:,1,1,1), kernel%x(:,j), -F_2D(j,3), n)
     end do
   end subroutine actuator_line_source_term_compute_cpu
 
