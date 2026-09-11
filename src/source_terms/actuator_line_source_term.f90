@@ -56,6 +56,7 @@ module actuator_line_source_term
 
   !> Actuator line id counter
   integer, save :: next_actuator_line_id = 0
+  public :: make_registry_name
 
   !> Actuator line source term.
   type, public, extends(source_term_t) :: actuator_line_source_term_t
@@ -108,7 +109,7 @@ module actuator_line_source_term
      !> Aerodynamicc coefficients file id
      integer :: coefs_out_num 
      !> Force non-dimensionalizaton factor
-     real(kind=rp), pointer :: force_nondim_factor
+     real(kind=rp) :: force_nondim_factor
 
    contains
      private
@@ -131,7 +132,6 @@ module actuator_line_source_term
      procedure, pass(this) :: init_interpolator
      procedure, pass(this) :: F2D
      procedure, pass(this) :: compute_resultant_force
-     procedure, pass(this) :: make_registry_name
      procedure, nopass :: cross
 
   end type actuator_line_source_term_t
@@ -200,7 +200,7 @@ contains
   !! @param interp Global interpolator.
   !! @param id_out Optional output for the actuator line instance id.
   subroutine actuator_line_source_term_init_from_components(this, fields, coef, N, CL, V_inf, b, AR, eps, &
-        x_center, y_center, z_center, gamma_vec, interp, id_out)
+        x_center, y_center, z_center, gamma_vec, interp, id_out, force_nondim_factor)
     class(actuator_line_source_term_t), intent(inout) :: this
     type(field_list_t), intent(in), target :: fields
     type(coef_t), intent(in), target :: coef
@@ -216,9 +216,10 @@ contains
     real(kind=rp), intent(in) :: gamma_vec(:)
     type(global_interpolation_t), pointer, intent(in) :: interp
     integer, optional, intent(out) :: id_out
+    real(kind=rp), optional, intent(out) :: force_nondim_factor
 
     real(kind=rp) :: start_time, end_time
-    character(len=:), allocatable :: resultant_force_name, force_nondim_factor_name
+    character(len=:), allocatable :: resultant_force_name
 
     ! Assign instance id
     next_actuator_line_id = next_actuator_line_id + 1
@@ -256,15 +257,13 @@ contains
     call this%compute_kernel() ! Pre-compute kernels
     call this%init_interpolator() ! Initialize interpolator
 
-    call this%make_registry_name("resultant_force", resultant_force_name)
+    resultant_force_name = make_registry_name("resultant_force", this%instance_id)
     call neko_registry%add_vector(2, resultant_force_name, .false.)
     this%resultant_force => neko_registry%get_vector(resultant_force_name)
 
     ! Force non-dimensionalization factor CL = (2 * AR / (V_inf * b)**2) * L
     ! Since simulation is incompressible, rho cancels out with Kutta-Joukowski force computation
-    call this%make_registry_name("force_nondim_factor", force_nondim_factor_name)
-    call neko_registry%add_real_scalar(2.0_rp * this%AR / (V_inf * this%b)**2, force_nondim_factor_name, .false.)
-    this%force_nondim_factor => neko_registry%get_real_scalar(force_nondim_factor_name)
+    this%force_nondim_factor = 2.0_rp * this%AR / (V_inf * this%b)**2
 
     ! Create aerodynamics coefficients file
     this%coefs_out_num = 10
@@ -277,6 +276,10 @@ contains
 
     if (present(id_out)) then
       id_out = this%instance_id
+    end if
+
+    if (present(force_nondim_factor)) then
+      force_nondim_factor = this%force_nondim_factor
     end if
 
   end subroutine actuator_line_source_term_init_from_components
@@ -356,7 +359,7 @@ contains
     ! Create actuator line elements
     ! 1st dimension: x, y, z coordinates
     ! 2nd dimension: elements
-    call this%make_registry_name("x_vec", x_vec_name)
+    x_vec_name = make_registry_name("x_vec", this%instance_id)
     call neko_registry%add_matrix(3, this%N, x_vec_name, .false.)
     this%x_vec => neko_registry%get_matrix(x_vec_name)
 
@@ -387,7 +390,7 @@ contains
 
     ! Allocate kernels
     u => neko_registry%get_field_by_name('u') ! Use any field
-    call this%make_registry_name("kernel", kernel_name)
+    kernel_name = make_registry_name("kernel", this%instance_id)
     call neko_registry%add_matrix(u%dof%size(), this%N, kernel_name, .false.)
     this%kernel => neko_registry%get_matrix(kernel_name)
 
@@ -424,9 +427,9 @@ contains
     class(actuator_line_source_term_t), intent(inout) :: this
     character(len=:), allocatable :: u_name, v_name, w_name
 
-    call this%make_registry_name("u_interp", u_name)
-    call this%make_registry_name("v_interp", v_name)
-    call this%make_registry_name("w_interp", w_name)
+    u_name = make_registry_name("u_interp", this%instance_id)
+    v_name = make_registry_name("v_interp", this%instance_id)
+    w_name = make_registry_name("w_interp", this%instance_id)
 
     call this%interpolator%find_points(this%x_vec%x, this%N) ! Find points and their owners
 
@@ -491,16 +494,17 @@ contains
 
   end subroutine compute_resultant_force
 
-  subroutine make_registry_name(this, base_name, registry_name)
-    class(actuator_line_source_term_t), intent(in) :: this
+  function make_registry_name(base_name, instance_id) result(registry_name)
     character(len=*), intent(in) :: base_name
-    character(len=:), allocatable, intent(out) :: registry_name
-    character(len=64) :: temp_name
+    integer, intent(in) :: instance_id
 
-    write(temp_name, '("alm_", A, "_", I0)') trim(base_name), this%instance_id
+    character(len=64) :: temp_name
+    character(len=:), allocatable :: registry_name
+ 
+    write(temp_name, '("alm_", A, "_", I0)') trim(base_name), instance_id
     registry_name = trim(temp_name)
 
-  end subroutine make_registry_name
+  end function make_registry_name
 
   !> Computes the cross product of two 3D vectors.
   subroutine cross(a, b, c)
