@@ -94,7 +94,7 @@ module actuator_line_source_term
      !> Velocities interpolated at the actuator line (z-component)
      type(vector_t), pointer :: w_interp => null()
      !> Circulation vector
-     type(vector_t), pointer :: gamma_vec => null()
+     real(kind=rp), allocatable :: gamma_vec(:)
      !> Sectional lift distribution
      real(kind=rp), allocatable :: lift_dist(:)
      !> Sectional drag distribution
@@ -117,7 +117,7 @@ module actuator_line_source_term
      procedure, public, pass(this) :: init => &
           actuator_line_source_term_init_from_json
      !> The constructor from type components.
-     procedure, public, pass(this) :: init_from_compenents => &
+     procedure, public, pass(this) :: init_from_components => &
           actuator_line_source_term_init_from_components
      !> Destructor.
      procedure, public, pass(this) :: free => actuator_line_source_term_free
@@ -218,7 +218,7 @@ contains
     integer, optional, intent(out) :: id_out
 
     real(kind=rp) :: start_time, end_time
-    character(len=:), allocatable :: resultant_force_name, gamma_name, force_nondim_factor_name
+    character(len=:), allocatable :: resultant_force_name, force_nondim_factor_name
 
     ! Assign instance id
     next_actuator_line_id = next_actuator_line_id + 1
@@ -245,11 +245,7 @@ contains
     this%x_center = x_center
     this%y_center = y_center
     this%z_center = z_center
-
-    call this%make_registry_name("gamma", gamma_name)
-    call neko_registry%add_vector(this%N, gamma_name, .false.)
-    this%gamma_vec => neko_registry%get_vector(gamma_name)
-    this%gamma_vec%x = gamma_vec(:)
+    this%gamma_vec = gamma_vec
 
     if (.not. this%owns_interpolator) then
        this%interpolator => interp
@@ -295,6 +291,9 @@ contains
     if (allocated(this%xminus_vec)) then
       deallocate(this%xminus_vec)
     end if
+    if (allocated(this%gamma_vec)) then
+      deallocate(this%gamma_vec)
+    end if
     if (allocated(this%lift_dist)) then
       deallocate(this%lift_dist)
     end if
@@ -304,7 +303,6 @@ contains
 
     nullify(this%kernel)
     nullify(this%x_vec)
-    nullify(this%gamma_vec)
     nullify(this%resultant_force)
     nullify(this%u_interp)
     nullify(this%v_interp)
@@ -471,7 +469,7 @@ contains
 
     do j = 1, this%N
       u_vec = [this%u_interp%x(j), this%v_interp%x(j), this%w_interp%x(j)]
-      call cross(u_vec, [0.0_rp, this%gamma_vec%x(j), 0.0_rp], F_2D(j,:))
+      call cross(u_vec, [0.0_rp, this%gamma_vec(j), 0.0_rp], F_2D(j,:))
       this%lift_dist(j) = F_2D(j,3)
       this%drag_dist(j) = F_2D(j,1)
     end do
