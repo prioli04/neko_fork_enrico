@@ -66,12 +66,8 @@ module actuator_line_source_term
      integer :: instance_id
      !> Number of actuator line elements
      integer :: N
-     !> Target lift coefficient
-     real(kind=rp) :: CL_target
      !> Wingspan
      real(kind=rp) :: b
-     !> Aspect ratio
-     real(kind=rp) :: AR
      !> Gaussian kernel core size
      real(kind=rp) :: eps
      !> Actuator line center X coordinate
@@ -155,14 +151,13 @@ contains
     character(len=*), intent(in) :: variable_name
 
     integer :: N
-    real(kind=rp) :: CL, V_inf, b, AR, eps, x_center, y_center, z_center
+    real(kind=rp) :: V_inf, b, AR, S, eps, x_center, y_center, z_center, force_nondim_factor
     real(kind=rp), allocatable :: gamma_vec(:)
     type(field_t), pointer :: u
 
     ! ------------------------------------------------------------------------ !
     ! Read the options for the actuator line source term
     call json_get(json, 'N', N)
-    call json_get(json, 'CL_target', CL)
     call json_get(json, 'V_inf', V_inf)
     call json_get(json, 'b', b)
     call json_get(json, 'AR', AR)
@@ -179,7 +174,12 @@ contains
     u => neko_registry%get_field_by_name('u') ! Use any field
     call this%interpolator%init(u%dof)
 
-    call actuator_line_source_term_init_from_components(this, fields, coef, N, CL, V_inf, b, AR, eps, &
+    ! Force non-dimensionalization factor CL = L / (0.5 * rho * V^2 * S)
+    ! For now, rho assumed to be 1
+    S = b**2 / AR
+    force_nondim_factor = 0.5_rp * V_inf**2 * S
+
+    call actuator_line_source_term_init_from_components(this, fields, coef, N, b, force_nondim_factor, eps, &
         x_center, y_center, z_center, gamma_vec(:), this%interpolator)
 
   end subroutine actuator_line_source_term_init_from_json
@@ -188,10 +188,8 @@ contains
   !! @param fields A list of fields for adding the source values.
   !! @param coef The SEM coeffs.
   !! @param N Number of actuator line elements.
-  !! @param CL Target lift coefficient.
-  !! @param V_inf Free stream velocity.
   !! @param b Wingspan.
-  !! @param AR Aspect ratio.
+  !! @param force_nondim_factor Force non-dimensionalizaton factor.
   !! @param eps Gaussian kernel core size.
   !! @param x_center Actuator line center X coordinate.
   !! @param y_center Actuator line center Y coordinate.
@@ -199,16 +197,14 @@ contains
   !! @param gamma_vec Circulation vector.
   !! @param interp Global interpolator.
   !! @param id_out Optional output for the actuator line instance id.
-  subroutine actuator_line_source_term_init_from_components(this, fields, coef, N, CL, V_inf, b, AR, eps, &
-        x_center, y_center, z_center, gamma_vec, interp, id_out, force_nondim_factor)
+  subroutine actuator_line_source_term_init_from_components(this, fields, coef, N, b, force_nondim_factor, eps, &
+        x_center, y_center, z_center, gamma_vec, interp, id_out)
     class(actuator_line_source_term_t), intent(inout) :: this
     type(field_list_t), intent(in), target :: fields
     type(coef_t), intent(in), target :: coef
     integer, intent(in) :: N
-    real(kind=rp), intent(in) :: CL
-    real(kind=rp), intent(in) :: V_inf
     real(kind=rp), intent(in) :: b
-    real(kind=rp), intent(in) :: AR
+    real(kind=rp), intent(in) :: force_nondim_factor
     real(kind=rp), intent(in) :: eps
     real(kind=rp), intent(in) :: x_center
     real(kind=rp), intent(in) :: y_center
@@ -216,7 +212,6 @@ contains
     real(kind=rp), intent(in) :: gamma_vec(:)
     type(global_interpolation_t), pointer, intent(in) :: interp
     integer, optional, intent(out) :: id_out
-    real(kind=rp), optional, intent(out) :: force_nondim_factor
 
     real(kind=rp) :: start_time, end_time
     character(len=:), allocatable :: resultant_force_name
@@ -239,14 +234,13 @@ contains
 
     ! Assign parameters
     this%N = N
-    this%CL_target = CL
     this%b = b
-    this%AR = AR
     this%eps = eps
     this%x_center = x_center
     this%y_center = y_center
     this%z_center = z_center
     this%gamma_vec = gamma_vec
+    this%force_nondim_factor = force_nondim_factor
 
     if (.not. this%owns_interpolator) then
        this%interpolator => interp
@@ -261,25 +255,13 @@ contains
     call neko_registry%add_vector(2, resultant_force_name, .false.)
     this%resultant_force => neko_registry%get_vector(resultant_force_name)
 
-    ! Force non-dimensionalization factor CL = (2 * AR / (V_inf * b)**2) * L
-    ! Since simulation is incompressible, rho cancels out with Kutta-Joukowski force computation
-    this%force_nondim_factor = 2.0_rp * this%AR / (V_inf * this%b)**2
-
     ! Create aerodynamics coefficients file
     this%coefs_out_num = 10
     open(unit=this%coefs_out_num, file="coefs.csv", status="replace", action="write")
     write(this%coefs_out_num, *) "t, CL, CD"
     
-    ! gamma_0 = 2 * CL * V * b / (pi * AR)
-    ! Gamma(y) = gamma_0 * sqrt(1 - (2y/b)^2)
-    ! gamm(j) = 2.0 * alm_CL * V_inf * alm_b / (pi * alm_AR) * sqrt(1 - (2.0 * alm_x_vec(j, 2) / alm_b)**2)
-
     if (present(id_out)) then
       id_out = this%instance_id
-    end if
-
-    if (present(force_nondim_factor)) then
-      force_nondim_factor = this%force_nondim_factor
     end if
 
   end subroutine actuator_line_source_term_init_from_components
@@ -479,8 +461,8 @@ contains
 
     ! Print and save to coefs file
     call this%compute_resultant_force()
-    CL = this%resultant_force%x(1) * this%force_nondim_factor
-    CD = this%resultant_force%x(2) * this%force_nondim_factor
+    CL = this%resultant_force%x(1) / this%force_nondim_factor
+    CD = this%resultant_force%x(2) / this%force_nondim_factor
     write(this%coefs_out_num, *) time%t, ",", CL, ",", CD
 
   end subroutine F2D
