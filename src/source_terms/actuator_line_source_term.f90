@@ -76,12 +76,10 @@ module actuator_line_source_term
      real(kind=rp) :: y_center
      !> Actuator line center Z coordinate
      real(kind=rp) :: z_center
-     !> Actuator line elements' midpoint coordinates
-     type(matrix_t), pointer :: x_vec => null()
-     !> Actuator line elements' right node coordinates
-     real(kind=rp), allocatable :: xplus_vec(:,:)
-     !> Actuator line elements' left node coordinates
-     real(kind=rp), allocatable :: xminus_vec(:,:)
+     !> Actuator line elements' centroids
+     type(matrix_t), pointer :: elem_center => null()
+     !> Actuator line elements' nodal coordinates
+     real(kind=rp), allocatable :: nodes_coord(:,:)
      !> Gaussian kernel values (entire domain and for each actuator line elements)
      type(matrix_t), pointer :: kernel => null()
      !> Velocities interpolated at the actuator line (x-component)
@@ -104,8 +102,6 @@ module actuator_line_source_term
      logical :: owns_interpolator = .false.
      !> Aerodynamicc coefficients file id
      integer :: coefs_out_num 
-     !> Force non-dimensionalizaton factor
-     real(kind=rp) :: force_nondim_factor
 
    contains
      private
@@ -151,16 +147,14 @@ contains
     character(len=*), intent(in) :: variable_name
 
     integer :: N
-    real(kind=rp) :: V_inf, b, AR, S, eps, x_center, y_center, z_center, force_nondim_factor
+    real(kind=rp) :: b, eps, x_center, y_center, z_center
     real(kind=rp), allocatable :: gamma_vec(:)
     type(field_t), pointer :: u
 
     ! ------------------------------------------------------------------------ !
     ! Read the options for the actuator line source term
     call json_get(json, 'N', N)
-    call json_get(json, 'V_inf', V_inf)
     call json_get(json, 'b', b)
-    call json_get(json, 'AR', AR)
     call json_get(json, 'eps', eps)
     call json_get(json, 'xcenter', x_center)
     call json_get(json, 'ycenter', y_center)
@@ -174,12 +168,7 @@ contains
     u => neko_registry%get_field_by_name('u') ! Use any field
     call this%interpolator%init(u%dof)
 
-    ! Force non-dimensionalization factor CL = L / (0.5 * rho * V^2 * S)
-    ! For now, rho assumed to be 1
-    S = b**2 / AR
-    force_nondim_factor = 0.5_rp * V_inf**2 * S
-
-    call actuator_line_source_term_init_from_components(this, fields, coef, N, b, force_nondim_factor, eps, &
+    call actuator_line_source_term_init_from_components(this, fields, coef, N, b, eps, &
         x_center, y_center, z_center, gamma_vec(:), this%interpolator)
 
   end subroutine actuator_line_source_term_init_from_json
@@ -189,7 +178,6 @@ contains
   !! @param coef The SEM coeffs.
   !! @param N Number of actuator line elements.
   !! @param b Wingspan.
-  !! @param force_nondim_factor Force non-dimensionalizaton factor.
   !! @param eps Gaussian kernel core size.
   !! @param x_center Actuator line center X coordinate.
   !! @param y_center Actuator line center Y coordinate.
@@ -197,14 +185,13 @@ contains
   !! @param gamma_vec Circulation vector.
   !! @param interp Global interpolator.
   !! @param id_out Optional output for the actuator line instance id.
-  subroutine actuator_line_source_term_init_from_components(this, fields, coef, N, b, force_nondim_factor, eps, &
+  subroutine actuator_line_source_term_init_from_components(this, fields, coef, N, b, eps, &
         x_center, y_center, z_center, gamma_vec, interp, id_out)
     class(actuator_line_source_term_t), intent(inout) :: this
     type(field_list_t), intent(in), target :: fields
     type(coef_t), intent(in), target :: coef
     integer, intent(in) :: N
     real(kind=rp), intent(in) :: b
-    real(kind=rp), intent(in) :: force_nondim_factor
     real(kind=rp), intent(in) :: eps
     real(kind=rp), intent(in) :: x_center
     real(kind=rp), intent(in) :: y_center
@@ -240,7 +227,6 @@ contains
     this%y_center = y_center
     this%z_center = z_center
     this%gamma_vec = gamma_vec
-    this%force_nondim_factor = force_nondim_factor
 
     if (.not. this%owns_interpolator) then
        this%interpolator => interp
@@ -258,7 +244,7 @@ contains
     ! Create aerodynamics coefficients file
     this%coefs_out_num = 10
     open(unit=this%coefs_out_num, file="coefs.csv", status="replace", action="write")
-    write(this%coefs_out_num, *) "t, CL, CD"
+    write(this%coefs_out_num, *) "t, Lift, Drags"
     
     if (present(id_out)) then
       id_out = this%instance_id
@@ -270,11 +256,8 @@ contains
   subroutine actuator_line_source_term_free(this)
     class(actuator_line_source_term_t), intent(inout) :: this
 
-    if (allocated(this%xplus_vec)) then
-      deallocate(this%xplus_vec)
-    end if
-    if (allocated(this%xminus_vec)) then
-      deallocate(this%xminus_vec)
+    if (allocated(this%nodes_coord)) then
+      deallocate(this%nodes_coord)
     end if
     if (allocated(this%gamma_vec)) then
       deallocate(this%gamma_vec)
@@ -287,7 +270,7 @@ contains
     end if
 
     nullify(this%kernel)
-    nullify(this%x_vec)
+    nullify(this%elem_center)
     nullify(this%resultant_force)
     nullify(this%u_interp)
     nullify(this%v_interp)
@@ -335,27 +318,30 @@ contains
     class(actuator_line_source_term_t), intent(inout) :: this
     real(kind=rp) :: dy
     integer :: j
-    character(len=:), allocatable :: x_vec_name
+    character(len=:), allocatable :: elem_center_name
 
     ! ------------------------------------------------------------------------ !
     ! Create actuator line elements
     ! 1st dimension: x, y, z coordinates
     ! 2nd dimension: elements
-    x_vec_name = make_registry_name("x_vec", this%instance_id)
-    call neko_registry%add_matrix(3, this%N, x_vec_name, .false.)
-    this%x_vec => neko_registry%get_matrix(x_vec_name)
+    elem_center_name = make_registry_name("elem_center", this%instance_id)
+    call neko_registry%add_matrix(3, this%N, elem_center_name, .false.)
+    this%elem_center => neko_registry%get_matrix(elem_center_name)
 
-    allocate(this%xplus_vec(3, this%N))
-    allocate(this%xminus_vec(3, this%N))
+    allocate(this%nodes_coord(3, this%N + 1))
     allocate(this%lift_dist(this%N))
     allocate(this%drag_dist(this%N))
 
-    dy = this%b / real(this%N, kind=rp)
+    this%nodes_coord = 0.0_rp
+    this%elem_center%x = 0.0_rp
 
+    dy = this%b / real(this%N, kind=rp)
+    this%nodes_coord(2, 1) = - 0.5_rp * this%b
+
+    ! Uniformly spaced nodes
     do j = 1, this%N
-      this%x_vec%x(:, j) = [this%x_center, this%y_center - 0.5_rp * this%b + dy * (j - 0.5_rp), this%z_center]
-      this%xminus_vec(:, j) = this%x_vec%x(:, j) - [0.0_rp, 0.5_rp * dy, 0.0_rp]
-      this%xplus_vec(:, j) = this%x_vec%x(:, j) + [0.0_rp, 0.5_rp * dy, 0.0_rp]
+      this%nodes_coord(2, j + 1) = this%nodes_coord(2, 1) + real(j, kind=rp) * dy
+      this%elem_center%x(2, j) = 0.5_rp * (this%nodes_coord(2, j) + this%nodes_coord(2, j + 1))
     end do
     
   end subroutine discretize_line
@@ -365,8 +351,8 @@ contains
     class(actuator_line_source_term_t), intent(inout) :: this
 
     integer :: i, j
-    real(kind=rp) :: x_vec_ij(3), xplus(3), xminus(3), xp_xm(3)
-    real(kind=rp) :: x, y, z, lminus, lplus, d, xp_xm_norm
+    real(kind=rp) :: x_ij(3), xplus(3), xminus(3), t_hat(3)
+    real(kind=rp) :: x, y, z, lminus, lplus, d
     type(field_t), pointer :: u
     character(len=:), allocatable :: kernel_name
 
@@ -378,11 +364,10 @@ contains
 
     ! Loop through all actuator line elements
     do j = 1, this%N
-      xplus = this%xplus_vec(:, j)
-      xminus = this%xminus_vec(:, j)
+      xplus = this%nodes_coord(:, j + 1) ! Right node coordinate
+      xminus = this%nodes_coord(:, j) ! Left node coordinate
 
-      xp_xm = xplus - xminus
-      xp_xm_norm = norm2(xp_xm)
+      t_hat = (xplus - xminus) / norm2(xplus - xminus) ! Actuator line element direction (from left node to right node)
 
       ! Loop through all mesh nodes
       do i = 1, u%dof%size()
@@ -391,11 +376,11 @@ contains
         y = u%dof%y(i,1,1,1)
         z = u%dof%z(i,1,1,1)
 
-        x_vec_ij = [x, y, z]
+        x_ij = [x, y, z] ! Domain point to evaluate kernel
 
-        lplus = dot_product((x_vec_ij - xplus), xp_xm) / xp_xm_norm
-        lminus = lplus + xp_xm_norm
-        d = sqrt(norm2(x_vec_ij - xminus)**2 - lminus**2)
+        lminus = dot_product(x_ij - xminus, t_hat) ! Length of projection of the distance between the domain point and the element's left node
+        lplus = dot_product(x_ij - xplus, t_hat) ! Length of projection of the distance between the domain point and the element's right node
+        d = norm2(cross(x_ij - xminus, t_hat)) ! Distance to the element
 
         this%kernel%x(i,j) = (1.0 / (pi * this%eps**2)) * exp(- d**2 / this%eps**2) * &
                            (erf(lminus / this%eps) - erf(lplus / this%eps)) / 2.0
@@ -413,7 +398,7 @@ contains
     v_name = make_registry_name("v_interp", this%instance_id)
     w_name = make_registry_name("w_interp", this%instance_id)
 
-    call this%interpolator%find_points(this%x_vec%x, this%N) ! Find points and their owners
+    call this%interpolator%find_points(this%elem_center%x, this%N) ! Find points and their owners
 
     ! Initialize interpolated velocities vectors
     call neko_registry%add_vector(this%N, u_name, .false.)
@@ -433,7 +418,7 @@ contains
     real(kind=rp), intent(out) :: F_2D(this%N, 3)
 
     integer :: j
-    real(kind=rp) :: u_vec(3), CL, CD
+    real(kind=rp) :: u_vec(3), lift, drag
     type (field_t), pointer :: up, vp, wp
 
     up => neko_registry%get_field_by_name("u")
@@ -454,16 +439,16 @@ contains
 
     do j = 1, this%N
       u_vec = [this%u_interp%x(j), this%v_interp%x(j), this%w_interp%x(j)]
-      call cross(u_vec, [0.0_rp, this%gamma_vec(j), 0.0_rp], F_2D(j,:))
+      F_2D(j,:) = cross(u_vec, [0.0_rp, this%gamma_vec(j), 0.0_rp])
       this%lift_dist(j) = F_2D(j,3)
       this%drag_dist(j) = F_2D(j,1)
     end do
 
     ! Print and save to coefs file
     call this%compute_resultant_force()
-    CL = this%resultant_force%x(1) / this%force_nondim_factor
-    CD = this%resultant_force%x(2) / this%force_nondim_factor
-    write(this%coefs_out_num, *) time%t, ",", CL, ",", CD
+    lift = this%resultant_force%x(1)
+    drag = this%resultant_force%x(2)
+    write(this%coefs_out_num, *) time%t, ",", lift, ",", drag
 
   end subroutine F2D
 
@@ -489,13 +474,13 @@ contains
   end function make_registry_name
 
   !> Computes the cross product of two 3D vectors.
-  subroutine cross(a, b, c)
+  function cross(a, b) result(c)
     real(kind=rp), intent(in) :: a(3), b(3)
-    real(kind=rp), intent(out) :: c(3)
+    real(kind=rp) :: c(3)
 
     c(1) = a(2) * b(3) - a(3) * b(2)
     c(2) = a(3) * b(1) - a(1) * b(3)
     c(3) = a(1) * b(2) - a(2) * b(1)
-  end subroutine cross
+  end function cross
 
 end module actuator_line_source_term
