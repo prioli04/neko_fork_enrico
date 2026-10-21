@@ -79,7 +79,7 @@ module actuator_line_source_term
      !> Actuator line elements' centroids
      type(matrix_t), pointer :: elem_center => null()
      !> Actuator line elements' nodal coordinates
-     real(kind=rp), allocatable :: nodes_coord(:,:)
+     type(matrix_t), pointer :: nodes_coord => null()
      !> Gaussian kernel values (entire domain and for each actuator line elements)
      type(matrix_t), pointer :: kernel => null()
      !> Velocities interpolated at the actuator line (x-component)
@@ -244,7 +244,7 @@ contains
     ! Create aerodynamics coefficients file
     this%coefs_out_num = 10
     open(unit=this%coefs_out_num, file="coefs.csv", status="replace", action="write")
-    write(this%coefs_out_num, *) "t, Lift, Drags"
+    write(this%coefs_out_num, *) "t, Lift, Drag"
     
     if (present(id_out)) then
       id_out = this%instance_id
@@ -256,9 +256,6 @@ contains
   subroutine actuator_line_source_term_free(this)
     class(actuator_line_source_term_t), intent(inout) :: this
 
-    if (allocated(this%nodes_coord)) then
-      deallocate(this%nodes_coord)
-    end if
     if (allocated(this%gamma_vec)) then
       deallocate(this%gamma_vec)
     end if
@@ -271,6 +268,7 @@ contains
 
     nullify(this%kernel)
     nullify(this%elem_center)
+    nullify(this%nodes_coord)
     nullify(this%resultant_force)
     nullify(this%u_interp)
     nullify(this%v_interp)
@@ -318,7 +316,7 @@ contains
     class(actuator_line_source_term_t), intent(inout) :: this
     real(kind=rp) :: dy
     integer :: j
-    character(len=:), allocatable :: elem_center_name
+    character(len=:), allocatable :: elem_center_name, nodes_coord_name
 
     ! ------------------------------------------------------------------------ !
     ! Create actuator line elements
@@ -328,20 +326,23 @@ contains
     call neko_registry%add_matrix(3, this%N, elem_center_name, .false.)
     this%elem_center => neko_registry%get_matrix(elem_center_name)
 
-    allocate(this%nodes_coord(3, this%N + 1))
+    nodes_coord_name = make_registry_name("nodes_coord", this%instance_id)
+    call neko_registry%add_matrix(3, this%N + 1, nodes_coord_name, .false.)
+    this%nodes_coord => neko_registry%get_matrix(nodes_coord_name)
+
     allocate(this%lift_dist(this%N))
     allocate(this%drag_dist(this%N))
 
-    this%nodes_coord = 0.0_rp
+    this%nodes_coord%x = 0.0_rp
     this%elem_center%x = 0.0_rp
 
     dy = this%b / real(this%N, kind=rp)
-    this%nodes_coord(2, 1) = - 0.5_rp * this%b
+    this%nodes_coord%x(2, 1) = - 0.5_rp * this%b
 
     ! Uniformly spaced nodes
     do j = 1, this%N
-      this%nodes_coord(2, j + 1) = this%nodes_coord(2, 1) + real(j, kind=rp) * dy
-      this%elem_center%x(2, j) = 0.5_rp * (this%nodes_coord(2, j) + this%nodes_coord(2, j + 1))
+      this%nodes_coord%x(2, j + 1) = this%nodes_coord%x(2, 1) + real(j, kind=rp) * dy
+      this%elem_center%x(2, j) = 0.5_rp * (this%nodes_coord%x(2, j) + this%nodes_coord%x(2, j + 1))
     end do
     
   end subroutine discretize_line
@@ -364,8 +365,8 @@ contains
 
     ! Loop through all actuator line elements
     do j = 1, this%N
-      xplus = this%nodes_coord(:, j + 1) ! Right node coordinate
-      xminus = this%nodes_coord(:, j) ! Left node coordinate
+      xplus = this%nodes_coord%x(:, j + 1) ! Right node coordinate
+      xminus = this%nodes_coord%x(:, j) ! Left node coordinate
 
       t_hat = (xplus - xminus) / norm2(xplus - xminus) ! Actuator line element direction (from left node to right node)
 
