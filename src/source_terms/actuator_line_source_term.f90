@@ -44,7 +44,6 @@ module actuator_line_source_term
   use source_term, only : source_term_t
   use utils, only : neko_error
   use time_state, only : time_state_t
-
   use global_interpolation, only: global_interpolation_t
   use matrix, only: matrix_t
   use vector, only: vector_t
@@ -76,18 +75,22 @@ module actuator_line_source_term
      real(kind=rp) :: y_center
      !> Actuator line center Z coordinate
      real(kind=rp) :: z_center
-     !> Actuator line elements' centroids
-     type(matrix_t), pointer :: elem_center => null()
-     !> Actuator line elements' nodal coordinates
-     type(matrix_t), pointer :: nodes_coord => null()
-     !> Gaussian kernel values (entire domain and for each actuator line elements)
-     type(matrix_t), pointer :: kernel => null()
+     !> Gaussian kernel for the line convolution (Gaussian integrated on segments of constant f(x))
+     type(matrix_t), pointer :: kernel_line => null()
+     !> Gaussian kernel for the volume convolution (Gaussian evaluated at a point)
+     type(matrix_t), pointer :: kernel_volume => null()
      !> Velocities interpolated at the actuator line (x-component)
      type(vector_t), pointer :: u_interp => null()
      !> Velocities interpolated at the actuator line (y-component)
      type(vector_t), pointer :: v_interp => null()
      !> Velocities interpolated at the actuator line (z-component)
      type(vector_t), pointer :: w_interp => null()
+     !> Actuator line elements' lengths
+     type(vector_t), pointer :: dy => null()
+     !> Actuator line elements' centroids
+     real(kind=rp), allocatable :: elem_center(:,:)
+     !> Actuator line elements' nodal coordinates
+     real(kind=rp), allocatable :: nodes_coord(:,:)
      !> Circulation vector
      real(kind=rp), allocatable :: gamma_vec(:)
      !> Sectional lift distribution
@@ -100,7 +103,7 @@ module actuator_line_source_term
      type(global_interpolation_t), pointer :: interpolator => null()
      !> Flag to indicate if the source term owns the interpolator or if it was provided externally
      logical :: owns_interpolator = .false.
-     !> Aerodynamicc coefficients file id
+     !> Aerodynamic coefficients file id
      integer :: coefs_out_num 
 
    contains
@@ -120,7 +123,7 @@ module actuator_line_source_term
      ! ----------------------------------------------------------------------- !
      ! Internal subroutines for the actuator line method
      procedure, pass(this) :: discretize_line
-     procedure, pass(this) :: compute_kernel
+     procedure, pass(this) :: compute_kernels
      procedure, pass(this) :: init_interpolator
      procedure, pass(this) :: F2D
      procedure, pass(this) :: compute_resultant_force
@@ -164,9 +167,7 @@ contains
     ! Initialize interpolator
     allocate(this%interpolator)
     this%owns_interpolator = .true.
-
-    u => neko_registry%get_field_by_name('u') ! Use any field
-    call this%interpolator%init(u%dof)
+    call this%interpolator%init(coef%dof)
 
     call actuator_line_source_term_init_from_components(this, fields, coef, N, b, eps, &
         x_center, y_center, z_center, gamma_vec(:), this%interpolator)
@@ -234,8 +235,9 @@ contains
 
     ! Initialize variables
     call this%discretize_line() ! Create actuator line elements
-    call this%compute_kernel() ! Pre-compute kernels
+    call this%compute_kernels() ! Pre-compute kernels
     call this%init_interpolator() ! Initialize interpolator
+    allocate(this%lift_dist(this%N), this%drag_dist(this%N))
 
     resultant_force_name = make_registry_name("resultant_force", this%instance_id)
     call neko_registry%add_vector(2, resultant_force_name, .false.)
@@ -256,6 +258,12 @@ contains
   subroutine actuator_line_source_term_free(this)
     class(actuator_line_source_term_t), intent(inout) :: this
 
+    if (allocated(this%elem_center)) then
+      deallocate(this%elem_center)
+    end if
+    if (allocated(this%nodes_coord)) then
+      deallocate(this%nodes_coord)
+    end if
     if (allocated(this%gamma_vec)) then
       deallocate(this%gamma_vec)
     end if
@@ -266,9 +274,9 @@ contains
       deallocate(this%drag_dist)
     end if
 
-    nullify(this%kernel)
-    nullify(this%elem_center)
-    nullify(this%nodes_coord)
+    nullify(this%dy)
+    nullify(this%kernel_line)
+    nullify(this%kernel_volume)
     nullify(this%resultant_force)
     nullify(this%u_interp)
     nullify(this%v_interp)
@@ -301,9 +309,9 @@ contains
     call this%F2D(time, F_2D)
 
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       call actuator_line_source_term_compute_device(this%kernel, F_2D, this%fields)
+       call actuator_line_source_term_compute_device(this%kernel_line, F_2D, this%fields)
     else
-       call actuator_line_source_term_compute_cpu(this%kernel, F_2D, this%fields)
+       call actuator_line_source_term_compute_cpu(this%kernel_line, F_2D, this%fields)
     end if
 
   end subroutine actuator_line_source_term_compute
@@ -314,81 +322,84 @@ contains
   !> Create actuator line elements
   subroutine discretize_line(this)
     class(actuator_line_source_term_t), intent(inout) :: this
-    real(kind=rp) :: dy
+    real(kind=rp) :: delta_y
     integer :: j
-    character(len=:), allocatable :: elem_center_name, nodes_coord_name
-
+    character(len=:), allocatable :: dy_name
+  
     ! ------------------------------------------------------------------------ !
     ! Create actuator line elements
     ! 1st dimension: x, y, z coordinates
     ! 2nd dimension: elements
-    elem_center_name = make_registry_name("elem_center", this%instance_id)
-    call neko_registry%add_matrix(3, this%N, elem_center_name, .false.)
-    this%elem_center => neko_registry%get_matrix(elem_center_name)
+    allocate(this%elem_center(3, this%N), this%nodes_coord(3, this%N + 1))
 
-    nodes_coord_name = make_registry_name("nodes_coord", this%instance_id)
-    call neko_registry%add_matrix(3, this%N + 1, nodes_coord_name, .false.)
-    this%nodes_coord => neko_registry%get_matrix(nodes_coord_name)
-
-    allocate(this%lift_dist(this%N))
-    allocate(this%drag_dist(this%N))
-
-    this%nodes_coord%x = 0.0_rp
-    this%elem_center%x = 0.0_rp
-
-    dy = this%b / real(this%N, kind=rp)
-    this%nodes_coord%x(2, 1) = - 0.5_rp * this%b
+    dy_name = make_registry_name("dy", this%instance_id)
+    call neko_registry%add_vector(this%N, dy_name, .false.)
+    this%dy => neko_registry%get_vector(dy_name)
 
     ! Uniformly spaced nodes
+    delta_y = this%b / real(this%N, kind=rp)
+    this%dy%x = delta_y
+
+    this%nodes_coord = 0.0_rp
+    this%nodes_coord(2, 1) = - 0.5_rp * this%b ! Place first node at the left wing tip (Wing span aligned with y)
+
+    this%elem_center = 0.0_rp
+
     do j = 1, this%N
-      this%nodes_coord%x(2, j + 1) = this%nodes_coord%x(2, 1) + real(j, kind=rp) * dy
-      this%elem_center%x(2, j) = 0.5_rp * (this%nodes_coord%x(2, j) + this%nodes_coord%x(2, j + 1))
+      this%nodes_coord(2, j + 1) = this%nodes_coord(2, 1) + real(j, kind=rp) * delta_y
+      this%elem_center(2, j) = 0.5_rp * (this%nodes_coord(2, j) + this%nodes_coord(2, j + 1))
     end do
     
   end subroutine discretize_line
 
-  !> Computes Gaussian kernel, in the entire domain, for each actuator line element.
-  subroutine compute_kernel(this)
+  !> Computes Gaussian kernels. 
+  !> For the line convolution: represent the integration of the Gaussian over segments of constant f(x).
+  !> For the volume convolution: respresent just the Gaussian evaluated on a given pair of actuator line point and domain point
+  subroutine compute_kernels(this)
     class(actuator_line_source_term_t), intent(inout) :: this
 
-    integer :: i, j
-    real(kind=rp) :: x_ij(3), xplus(3), xminus(3), t_hat(3)
-    real(kind=rp) :: x, y, z, lminus, lplus, d
-    type(field_t), pointer :: u
-    character(len=:), allocatable :: kernel_name
+    integer :: i, j, n_dof
+    real(kind=rp) :: x_i(3), xplus(3), xminus(3), t_hat(3)
+    real(kind=rp) :: lminus, lplus, d_point_point, d_point_line
+    character(len=:), allocatable :: kernel_line_name, kernel_volume_name
+
+    n_dof = this%coef%dof%size()
 
     ! Allocate kernels
-    u => neko_registry%get_field_by_name('u') ! Use any field
-    kernel_name = make_registry_name("kernel", this%instance_id)
-    call neko_registry%add_matrix(u%dof%size(), this%N, kernel_name, .false.)
-    this%kernel => neko_registry%get_matrix(kernel_name)
+    kernel_line_name = make_registry_name("kernel_line", this%instance_id)
+    call neko_registry%add_matrix(n_dof, this%N, kernel_line_name, .false.)
+    this%kernel_line => neko_registry%get_matrix(kernel_line_name)
+
+    kernel_volume_name = make_registry_name("kernel_volume", this%instance_id)
+    call neko_registry%add_matrix(n_dof, this%N, kernel_volume_name, .false.)
+    this%kernel_volume => neko_registry%get_matrix(kernel_volume_name)
 
     ! Loop through all actuator line elements
     do j = 1, this%N
-      xplus = this%nodes_coord%x(:, j + 1) ! Right node coordinate
-      xminus = this%nodes_coord%x(:, j) ! Left node coordinate
+      xplus = this%nodes_coord(:, j + 1) ! Right node coordinate
+      xminus = this%nodes_coord(:, j) ! Left node coordinate
 
       t_hat = (xplus - xminus) / norm2(xplus - xminus) ! Actuator line element direction (from left node to right node)
 
       ! Loop through all mesh nodes
-      do i = 1, u%dof%size()
-        ! Get coordinates
-        x = u%dof%x(i,1,1,1)
-        y = u%dof%y(i,1,1,1)
-        z = u%dof%z(i,1,1,1)
+      do i = 1, n_dof
+        ! Get coordinates of domain point to evaluate the kernels
+        x_i = [this%coef%dof%x(i,1,1,1), this%coef%dof%y(i,1,1,1), this%coef%dof%z(i,1,1,1)]
 
-        x_ij = [x, y, z] ! Domain point to evaluate kernel
+        lminus = dot_product(x_i - xminus, t_hat) ! Length of projection of the distance between the domain point and the element's left node
+        lplus = dot_product(x_i - xplus, t_hat) ! Length of projection of the distance between the domain point and the element's right node
 
-        lminus = dot_product(x_ij - xminus, t_hat) ! Length of projection of the distance between the domain point and the element's left node
-        lplus = dot_product(x_ij - xplus, t_hat) ! Length of projection of the distance between the domain point and the element's right node
-        d = norm2(cross(x_ij - xminus, t_hat)) ! Distance to the element
+        d_point_point = norm2(this%elem_center(:, j) - x_i) ! Distance between domain point i and actuator line element center j (Point to point distance formula)
+        d_point_line = norm2(cross(x_i - xminus, t_hat)) ! Distance between domain point i and actuator line element j (Point to line distance formula)
 
-        this%kernel%x(i,j) = (1.0 / (pi * this%eps**2)) * exp(- d**2 / this%eps**2) * &
-                           (erf(lminus / this%eps) - erf(lplus / this%eps)) / 2.0
+        this%kernel_volume%x(i,j) = (1.0_rp / (pi**(1.5_rp) * this%eps**3)) * exp(-d_point_point**2 / this%eps**2)
+
+        this%kernel_line%x(i,j) = (1.0_rp / (pi * this%eps**2)) * exp(-d_point_line**2 / this%eps**2) * &
+                           (erf(lminus / this%eps) - erf(lplus / this%eps)) / 2.0_rp
       end do
     end do
 
-  end subroutine compute_kernel
+  end subroutine compute_kernels
 
   !> Initialize interpolator and find points' owners
   subroutine init_interpolator(this)
@@ -399,7 +410,7 @@ contains
     v_name = make_registry_name("v_interp", this%instance_id)
     w_name = make_registry_name("w_interp", this%instance_id)
 
-    call this%interpolator%find_points(this%elem_center%x, this%N) ! Find points and their owners
+    call this%interpolator%find_points(this%elem_center, this%N) ! Find points and their owners
 
     ! Initialize interpolated velocities vectors
     call neko_registry%add_vector(this%N, u_name, .false.)
